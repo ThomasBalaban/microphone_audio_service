@@ -23,7 +23,6 @@ from config import (
 )
 from websocket_server import WebSocketServer
 
-# transcriber_core lives in desktop_mon_gemini; config.py already added it to sys.path
 from transcriber_core.microphone import MicrophoneTranscriber
 
 
