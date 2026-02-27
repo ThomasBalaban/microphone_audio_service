@@ -60,11 +60,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         elif self.path == "/devices":
             try:
-                from config import MICROPHONE_DEVICE_ID
+                import config as _config
                 devices = _list_input_devices()
                 self._json(200, {
                     "devices":           devices,
-                    "current_device_id": MICROPHONE_DEVICE_ID,
+                    "current_device_id": _config.MICROPHONE_DEVICE_ID,
                 })
             except Exception as e:
                 self._json(500, {"error": str(e)})
