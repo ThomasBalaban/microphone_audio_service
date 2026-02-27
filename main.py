@@ -4,7 +4,7 @@ Microphone Audio Service — Entry Point
 
 Health check:    GET  http://localhost:8014/health
 List devices:    GET  http://localhost:8014/devices
-Set device:      POST http://localhost:8014/set-device  {"device_id": N}
+Set device:      POST httßp://localhost:8014/set-device  {"device_id": N}
 Shutdown:        POST http://localhost:8014/shutdown
 """
 
