@@ -188,15 +188,6 @@ class MicrophoneService:
 
                 # Hub events
                 self._emit_to_hub("spoken_word_context", {"context": text})
-                self._emit_to_hub("audio_context", {
-                    "context":    text,
-                    "is_partial": False,
-                    "metadata": {
-                        "source":     "microphone",
-                        "confidence": confidence,
-                        "id":         transcript_id,
-                    },
-                })
 
             except Empty:
                 continue
