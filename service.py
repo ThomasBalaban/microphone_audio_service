@@ -187,7 +187,7 @@ class MicrophoneService:
                     log(traceback.format_exc())
 
                 # Hub events
-                self._emit_to_hub("spoken_word_context", {"context": text})
+                self._emit_to_hub("spoken_word_context", {"context": text, "timestamp": payload["timestamp"]})
 
             except Empty:
                 continue
