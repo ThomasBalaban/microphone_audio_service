@@ -5,11 +5,6 @@ import os
 import sys
 
 # ── Path bootstrap ────────────────────────────────────────────────────────────
-# Adds THIS service directory first, then the parent projects folder.
-# transcriber_core/ can live in EITHER location:
-#   - /projects/microphone_audio_service/transcriber_core/   (own dir)
-#   - /projects/transcriber_core/                            (parent dir)
-# api_keys.py should be in this service's own folder.
 _THIS_DIR   = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_THIS_DIR)
 for _p in (_THIS_DIR, _PARENT_DIR):
@@ -37,8 +32,26 @@ except ImportError as e:
     raise
 
 # Audio
-MICROPHONE_DEVICE_ID = 5
-AUDIO_SAMPLE_RATE    = 16000
+AUDIO_SAMPLE_RATE      = 16000
+
+_PREFERRED_DEVICE_NAME = "Scarlett Solo 4th Gen"
+_FALLBACK_DEVICE_ID    = 5
+
+def _find_device_by_name(name: str) -> int | None:
+    try:
+        import sounddevice as sd
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_input_channels"] > 0 and name.lower() in dev["name"].lower():
+                print(f"[config] ✅ Found '{name}' → device_id={i} ({dev['name']})", flush=True)
+                return i
+    except Exception as e:
+        print(f"[config] ⚠️  Device lookup failed: {e}", flush=True)
+    return None
+
+_detected = _find_device_by_name(_PREFERRED_DEVICE_NAME)
+if _detected is None:
+    print(f"[config] ⚠️  '{_PREFERRED_DEVICE_NAME}' not found — falling back to device_id={_FALLBACK_DEVICE_ID}", flush=True)
+MICROPHONE_DEVICE_ID = _detected if _detected is not None else _FALLBACK_DEVICE_ID
 
 # Network
 WEBSOCKET_PORT    = 8013
