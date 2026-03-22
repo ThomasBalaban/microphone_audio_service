@@ -147,7 +147,8 @@ class MicrophoneService:
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _on_volume(self, level: float):
-        self.ws_server.broadcast({"type": "volume", "source": "mic", "level": level})
+        # self.ws_server.broadcast({"type": "volume", "source": "mic", "level": level})
+        pass
 
     # ── Poll loop ─────────────────────────────────────────────────────────────
 
