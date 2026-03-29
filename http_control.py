@@ -11,7 +11,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import sounddevice as sd
+import sounddevice as sd # type: ignore
 
 from config import HTTP_CONTROL_PORT, SERVICE_NAME
 
