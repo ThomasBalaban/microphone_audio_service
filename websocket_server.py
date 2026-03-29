@@ -8,7 +8,7 @@ import json
 import queue
 import threading
 import time
-import websockets
+import websockets  # type: ignore
 
 from config import WEBSOCKET_PORT
 

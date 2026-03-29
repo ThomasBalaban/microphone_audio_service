@@ -39,7 +39,7 @@ _FALLBACK_DEVICE_ID    = 5
 
 def _find_device_by_name(name: str) -> int | None:
     try:
-        import sounddevice as sd
+        import sounddevice as sd # type: ignore
         for i, dev in enumerate(sd.query_devices()):
             if dev["max_input_channels"] > 0 and name.lower() in dev["name"].lower():
                 print(f"[config] ✅ Found '{name}' → device_id={i} ({dev['name']})", flush=True)
