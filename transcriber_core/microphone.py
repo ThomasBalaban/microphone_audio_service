@@ -33,11 +33,11 @@ import traceback
 from queue import Queue
 from threading import Event, Lock, Thread
 
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
-from openai import OpenAI
-from scipy import signal
+import numpy as np # type: ignore
+import sounddevice as sd # type: ignore
+import soundfile as sf # type: ignore
+from openai import OpenAI # type: ignore
+from scipy import signal # type: ignore
 
 from .config import FS, MAX_THREADS, MICROPHONE_DEVICE_ID, SAVE_DIR
 
