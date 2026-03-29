@@ -7,8 +7,7 @@ import time
 import traceback
 import uuid
 from queue import Empty
-
-import socketio
+import socketio # type: ignore
 
 from config import (
     HUB_URL,
