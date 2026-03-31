@@ -1,29 +1,30 @@
 """
 transcriber_core/microphone.py
 ─────────────────────────────────────────────────────────────────────────────
-Improvements over the original:
+Speed improvements over the previous version:
 
-  1. OpenAI whisper-1 API  — far better accuracy on fast / loud speech than
-     the local parakeet-mlx model.
+  1. VAD_SILENCE_DURATION 0.55s → 0.30s
+       Saves ~250 ms at the tail of every utterance.
 
-  2. Adaptive noise gate   — on startup the mic is silently recorded for
-     NOISE_CALIBRATION_SECS to measure the ambient noise floor (A/C, fans,
-     room tone). The VAD energy threshold is set to noise_floor × multiplier
-     so the gate tracks your actual environment automatically.
+  2. 120 ms pre-roll ring buffer
+       The callback continuously keeps the last PRE_ROLL_SECS of audio in a
+       circular deque. Every flushed chunk is prepended with that pre-roll so
+       the shorter silence timeout doesn't clip the first phoneme of speech.
 
-  3. High-pass filter      — a 4th-order Butterworth HPF at HPF_CUTOFF_HZ
-     (80 Hz) is applied *before* the VAD energy check. This strips the low-
-     frequency rumble that A/C units produce, which was causing long periods
-     of false activity.
+  3. HTTP/2 on the OpenAI client (httpx)
+       Eliminates the per-request TCP + TLS handshake overhead when multiple
+       chunks are in-flight simultaneously. Falls back to HTTP/1.1 silently
+       if httpx[http2] isn't installed.
 
-  4. Pre-processing before transcription — the same HPF plus RMS
-     normalisation is applied to every chunk before it is sent to the API,
-     which gives Whisper a cleaner, consistently-levelled signal.
+  4. response_format="text"
+       Skips Whisper returning a JSON envelope — the API streams the plain
+       string directly, saving a small but free deserialization step.
 
-  5. In-memory WAV buffer — audio is written to an io.BytesIO object instead
-     of a temp file on disk, keeping latency low.
+  5. Calibration 2.5s → 1.5s
+       Room-noise RMS stabilises in well under a second; 1.5s is plenty.
 """
 
+import collections
 import io
 import os
 import re
@@ -33,34 +34,56 @@ import traceback
 from queue import Queue
 from threading import Event, Lock, Thread
 
-import numpy as np # type: ignore
-import sounddevice as sd # type: ignore
-import soundfile as sf # type: ignore
-from openai import OpenAI # type: ignore
-from scipy import signal # type: ignore
+import numpy as np          # type: ignore
+import sounddevice as sd    # type: ignore
+import soundfile as sf      # type: ignore
+from scipy import signal    # type: ignore
 
 from .config import FS, MAX_THREADS, MICROPHONE_DEVICE_ID, SAVE_DIR
 
 # ── VAD / gate parameters ─────────────────────────────────────────────────────
-VAD_SILENCE_DURATION    = 0.55  # seconds of silence that ends an utterance
-VAD_MAX_SPEECH_DURATION = 15.0  # hard cap: flush even if speech never stops
+VAD_SILENCE_DURATION    = 0.30   # ⬇ was 0.55 — saves ~250 ms per utterance
+VAD_MAX_SPEECH_DURATION = 15.0
 
-NOISE_CALIBRATION_SECS  = 2.5   # how long to listen before opening the stream
-NOISE_GATE_MULTIPLIER   = 2.8   # threshold = noise_floor_rms × this value
-MIN_VAD_THRESHOLD       = 0.005 # never go below this (prevents hair-trigger)
-MAX_VAD_THRESHOLD       = 0.045 # never go above this (prevents deaf mode)
+NOISE_CALIBRATION_SECS  = 1.5   # ⬇ was 2.5
+NOISE_GATE_MULTIPLIER   = 2.8
+MIN_VAD_THRESHOLD       = 0.005
+MAX_VAD_THRESHOLD       = 0.045
+
+# ── Pre-roll ──────────────────────────────────────────────────────────────────
+PRE_ROLL_SECS = 0.12   # 120 ms prepended to every flushed chunk
 
 # ── Audio pre-processing ──────────────────────────────────────────────────────
-HPF_CUTOFF_HZ   = 80.0   # kill everything below this (A/C hum, desk rumble)
-SPEECH_NORM_RMS = 0.08   # target RMS after normalisation
+HPF_CUTOFF_HZ   = 80.0
+SPEECH_NORM_RMS = 0.08
+
+
+def _build_openai_client():
+    """
+    Build an OpenAI client that uses HTTP/2 when httpx[http2] is available.
+    Falls back to the default HTTP/1.1 client silently.
+    """
+    from api_keys import OPENAI_API_KEY  # noqa: PLC0415
+    try:
+        import httpx
+        http_client = httpx.Client(http2=True)
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+        print("✅ [Mic] OpenAI client ready (HTTP/2)", flush=True)
+    except Exception:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        print("✅ [Mic] OpenAI client ready (HTTP/1.1)", flush=True)
+    return client
 
 
 class MicrophoneTranscriber:
     """
-    Batch microphone transcriber.
+    Batch microphone transcriber with adaptive noise gate, HPF, pre-roll
+    buffer, and OpenAI Whisper-1 transcription.
 
-    Public interface is identical to the original so that service.py
-    and any other callers need no changes.
+    Public interface is identical to the original so service.py needs no
+    changes.
     """
 
     def __init__(self, keep_files=False, transcript_manager=None, device_id=None):
@@ -71,21 +94,20 @@ class MicrophoneTranscriber:
 
         os.makedirs(self.SAVE_DIR, exist_ok=True)
 
-        # ── OpenAI client ─────────────────────────────────────────────────────
-        try:
-            from api_keys import OPENAI_API_KEY  # noqa: PLC0415
-            self.client = OpenAI(api_key=OPENAI_API_KEY)
-            print("✅ [Mic] OpenAI Whisper-1 client ready", flush=True)
-        except Exception as exc:
-            print(f"❌ [Mic] OpenAI init failed: {exc}", flush=True)
-            raise
+        self.client = _build_openai_client()
 
-        # ── High-pass filter coefficients (built once, reused everywhere) ────
+        # High-pass filter (built once, reused everywhere)
         self._hpf_b, self._hpf_a = signal.butter(
             4, HPF_CUTOFF_HZ / (FS / 2), btype="high"
         )
 
-        # ── Thread-safety / state ─────────────────────────────────────────────
+        # Pre-roll ring buffer: stores the last PRE_ROLL_SECS of raw audio
+        _pre_roll_samples = int(FS * PRE_ROLL_SECS)
+        self._pre_roll: collections.deque = collections.deque(
+            maxlen=_pre_roll_samples
+        )
+
+        # Thread-safety / state
         self.result_queue    = Queue()
         self.stop_event      = Event()
         self.saved_files     = []
@@ -101,13 +123,11 @@ class MicrophoneTranscriber:
         self.speech_start_time  = None
         self.buffer_lock        = Lock()
 
-        # Will be set by _calibrate_noise_floor() inside run()
-        self.vad_threshold = 0.012
+        self.vad_threshold      = 0.012   # overwritten by calibration
 
         self.transcript_manager = transcript_manager
         self.volume_callback    = None
 
-        # Name correction table
         self.name_variations = {
             r"\bnaomi\b":        "Nami",
             r"\bnow may\b":      "Nami",
@@ -127,51 +147,31 @@ class MicrophoneTranscriber:
     # ── Public helpers ────────────────────────────────────────────────────────
 
     def set_volume_callback(self, callback):
-        """Register callback for GUI volume updates."""
         self.volume_callback = callback
 
     def stop(self):
-        """Signal the run loop to stop."""
         self.stop_event.set()
 
     # ── Audio pre-processing ──────────────────────────────────────────────────
 
     def _apply_hpf(self, audio: np.ndarray) -> np.ndarray:
-        """Apply the high-pass filter to remove low-frequency noise."""
         return signal.lfilter(self._hpf_b, self._hpf_a, audio).astype(np.float32)
 
     def _preprocess(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Full preprocessing pipeline used before transcription:
-          1. High-pass filter  — strips A/C hum / rumble
-          2. RMS normalise     — gives Whisper a consistent level regardless of
-                                 whether the speaker is quiet, loud, or shouting
-          3. Hard clip         — prevents clipping artefacts after normalisation
-        """
         filtered = self._apply_hpf(audio)
-
         rms = np.sqrt(np.mean(filtered ** 2))
         if rms > 1e-6:
             filtered = filtered * (SPEECH_NORM_RMS / rms)
-
         return np.clip(filtered, -1.0, 1.0).astype(np.float32)
 
     # ── Noise-floor calibration ───────────────────────────────────────────────
 
     def _calibrate_noise_floor(self, duration: float) -> float:
-        """
-        Record ambient audio (mic must be open to room noise) and set the VAD
-        threshold relative to the measured noise-floor RMS.
-
-        The HPF is applied first so that A/C rumble below 80 Hz doesn't inflate
-        the threshold and inadvertently mute your voice.
-        """
         print(
             f"🎙️  [Mic] Calibrating noise floor ({duration:.1f}s) — "
             "don't speak yet…",
             flush=True,
         )
-
         samples   = int(self.FS * duration)
         recording = sd.rec(
             samples,
@@ -191,15 +191,13 @@ class MicrophoneTranscriber:
                 MAX_VAD_THRESHOLD,
             )
         )
-
         print(
-            f"✅ [Mic] Noise RMS={noise_rms:.5f}  "
-            f"VAD threshold={threshold:.5f}",
+            f"✅ [Mic] Noise RMS={noise_rms:.5f}  VAD threshold={threshold:.5f}",
             flush=True,
         )
         return threshold
 
-    # ── Audio callback (runs in sounddevice thread) ───────────────────────────
+    # ── Audio callback ────────────────────────────────────────────────────────
 
     def audio_callback(self, indata, frames, timestamp, status):
         if self.stop_event.is_set():
@@ -210,26 +208,26 @@ class MicrophoneTranscriber:
         rms      = float(np.sqrt(np.mean(filtered ** 2)))
 
         if self.volume_callback:
-            # Scale so 0.08 RMS (typical speech) ≈ 1.0 on the meter
             self.volume_callback(min(1.0, rms / SPEECH_NORM_RMS))
 
         with self.buffer_lock:
             if rms > self.vad_threshold:
-                # ── Speech detected ───────────────────────────────────────────
                 if not self.is_speaking:
                     self.is_speaking       = True
                     self.speech_start_time = time.time()
+                    # Prepend pre-roll so we don't clip the first word
+                    pre_roll_audio = np.array(list(self._pre_roll), dtype=np.float32)
+                    if len(pre_roll_audio):
+                        self.speech_buffer = pre_roll_audio
 
                 self.speech_buffer      = np.concatenate([self.speech_buffer, raw])
                 self.silence_start_time = None
 
-                # Hard cap: flush if utterance runs too long
                 if time.time() - self.speech_start_time > VAD_MAX_SPEECH_DURATION:
                     self._flush_buffer()
 
             elif self.is_speaking:
-                # ── Trailing silence ──────────────────────────────────────────
-                # Keep buffering a little so the last word isn't clipped
+                # Buffer trailing silence so the last word isn't clipped
                 self.speech_buffer = np.concatenate([self.speech_buffer, raw])
 
                 if self.silence_start_time is None:
@@ -238,11 +236,12 @@ class MicrophoneTranscriber:
                 if time.time() - self.silence_start_time > VAD_SILENCE_DURATION:
                     self._flush_buffer()
 
+            else:
+                # Not speaking — keep the pre-roll ring buffer warm
+                self._pre_roll.extend(raw.tolist())
+
     def _flush_buffer(self):
-        """
-        Called inside buffer_lock.
-        Hands the accumulated speech buffer to a transcription thread.
-        """
+        """Called inside buffer_lock."""
         min_samples = int(self.FS * 0.3)
 
         if len(self.speech_buffer) > min_samples and self.active_threads < self.MAX_THREADS:
@@ -251,11 +250,11 @@ class MicrophoneTranscriber:
             self.is_speaking        = False
             self.silence_start_time = None
             self.speech_start_time  = None
+            self._pre_roll.clear()   # stale after a flush
 
             self.active_threads += 1
             Thread(target=self.process_chunk, args=(chunk,), daemon=True).start()
         else:
-            # Too short or too many threads — discard
             self.speech_buffer      = np.array([], dtype=np.float32)
             self.is_speaking        = False
             self.silence_start_time = None
@@ -264,16 +263,10 @@ class MicrophoneTranscriber:
     # ── Transcription ─────────────────────────────────────────────────────────
 
     def process_chunk(self, chunk: np.ndarray):
-        """
-        Pre-process audio and send to OpenAI whisper-1.
-        Writes to an in-memory BytesIO buffer — no temp files unless
-        keep_files=True.
-        """
         filename = None
         try:
             processed = self._preprocess(chunk)
 
-            # Build an in-memory WAV file
             buf = io.BytesIO()
             sf.write(buf, processed, self.FS, format="WAV", subtype="PCM_16")
             buf.seek(0)
@@ -281,12 +274,12 @@ class MicrophoneTranscriber:
             if self.keep_files:
                 filename = self.save_audio(chunk)
 
-            response = self.client.audio.transcriptions.create(
+            # response_format="text" → plain string, no JSON envelope to parse
+            text = self.client.audio.transcriptions.create(
                 model="whisper-1",
                 file=("audio.wav", buf, "audio/wav"),
                 language="en",
-                # Prompt nudges Whisper toward casual, fast-paced speech and
-                # away from adding filler punctuation / hallucinating silence.
+                response_format="text",
                 prompt=(
                     "Transcribe exactly as spoken. "
                     "The speaker may talk quickly, loudly, or trail off. "
@@ -294,10 +287,9 @@ class MicrophoneTranscriber:
                 ),
             )
 
-            text = (response.text or "").strip()
+            text = (text or "").strip()
 
             if text and len(text) >= 2:
-                # Name correction
                 for pattern, name in self.name_variations.items():
                     text = re.sub(pattern, name, text, flags=re.IGNORECASE)
 
@@ -324,14 +316,10 @@ class MicrophoneTranscriber:
     def run(self):
         try:
             info = sd.query_devices(self.device_id)
-            print(
-                f"\n🎤 [Mic] Device {self.device_id}: {info['name']}",
-                flush=True,
-            )
+            print(f"\n🎤 [Mic] Device {self.device_id}: {info['name']}", flush=True)
         except Exception as exc:
             print(f"⚠️  [Mic] Could not query device info: {exc}", flush=True)
 
-        # Calibrate noise gate *before* opening the live stream
         try:
             self.vad_threshold = self._calibrate_noise_floor(NOISE_CALIBRATION_SECS)
         except Exception as exc:
@@ -359,7 +347,4 @@ class MicrophoneTranscriber:
             traceback.print_exc()
         finally:
             self.stop_event.set()
-            print(
-                f"🎤 [Mic] Listener stopped (device {self.device_id}).",
-                flush=True,
-            )
+            print(f"🎤 [Mic] Listener stopped (device {self.device_id}).", flush=True)
