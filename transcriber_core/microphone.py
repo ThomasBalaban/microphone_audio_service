@@ -22,6 +22,24 @@ Speed improvements over the previous version:
 
   5. Calibration 2.5s → 1.5s
        Room-noise RMS stabilises in well under a second; 1.5s is plenty.
+
+Hallucination fixes (v2):
+
+  FIX 1 — MIN_CHUNK_RMS gate in process_chunk
+       Rejects chunks whose raw RMS is below MIN_CHUNK_RMS before any
+       normalization. Music/ambient noise that barely tripped VAD never
+       reaches Whisper.
+
+  FIX 2 — Conditional normalization in _preprocess
+       Previously any RMS > 1e-6 triggered normalization, boosting near-
+       silence up to SPEECH_NORM_RMS and feeding Whisper a convincingly
+       loud-but-meaningless signal. Now only normalizes when RMS > 0.01
+       (roughly the threshold for real speech energy).
+
+  FIX 3 — Post-transcription hallucination blocklist
+       Whisper-1 has well-known phantom outputs ("thank you for watching",
+       FEMA URLs, engvid, etc.) that appear when audio is ambiguous. Any
+       transcript containing a blocklist phrase is silently dropped.
 """
 
 import collections
@@ -56,6 +74,43 @@ PRE_ROLL_SECS = 0.12   # 120 ms prepended to every flushed chunk
 # ── Audio pre-processing ──────────────────────────────────────────────────────
 HPF_CUTOFF_HZ   = 80.0
 SPEECH_NORM_RMS = 0.08
+
+# ── Hallucination guards ──────────────────────────────────────────────────────
+# FIX 1: chunks whose raw RMS is below this are skipped before normalization
+# can inflate them. Tune down to 0.005 if soft speech is being dropped.
+MIN_CHUNK_RMS = 0.008
+
+# FIX 2: normalization is only applied when RMS exceeds this floor.
+# Prevents near-silence / music from being boosted to speech level.
+MIN_NORM_RMS = 0.01
+
+# FIX 3: Whisper-1 phantom outputs — transcripts matching any of these are
+# silently dropped. All comparisons are lowercased substring matches.
+_WHISPER_HALLUCINATIONS = {
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "don't forget to subscribe",
+    "like and subscribe",
+    "see you next time",
+    "see you in the next video",
+    "learn english",
+    "www.",
+    ".gov",
+    ".com",
+    "engvid",
+    "office of the president",
+    "this has been a presentation",
+    "subtitles by",
+    "translated by",
+    "[ music ]",
+    "[music]",
+    "♪",
+    # Whisper sometimes emits these when it hears only silence / noise
+    "you",                          # single-word phantom — too short to be real anyway
+    "thank you.",
+    "thanks.",
+}
 
 
 def _build_openai_client():
@@ -160,7 +215,11 @@ class MicrophoneTranscriber:
     def _preprocess(self, audio: np.ndarray) -> np.ndarray:
         filtered = self._apply_hpf(audio)
         rms = np.sqrt(np.mean(filtered ** 2))
-        if rms > 1e-6:
+        # FIX 2: only normalize when there's real signal.
+        # The old threshold (1e-6) boosted near-silence and music up to full
+        # speech level, feeding Whisper a convincingly loud but meaningless
+        # signal and triggering hallucinations.
+        if rms > MIN_NORM_RMS:
             filtered = filtered * (SPEECH_NORM_RMS / rms)
         return np.clip(filtered, -1.0, 1.0).astype(np.float32)
 
@@ -265,6 +324,17 @@ class MicrophoneTranscriber:
     def process_chunk(self, chunk: np.ndarray):
         filename = None
         try:
+            # FIX 1: reject low-energy chunks before normalization can inflate
+            # them. Music / ambient noise that barely crossed the VAD gate
+            # never reaches Whisper.
+            raw_rms = float(np.sqrt(np.mean(chunk ** 2)))
+            if raw_rms < MIN_CHUNK_RMS:
+                print(
+                    f"⏭️  [Mic] Chunk skipped — raw RMS {raw_rms:.5f} < {MIN_CHUNK_RMS} (not speech)",
+                    flush=True,
+                )
+                return
+
             processed = self._preprocess(chunk)
 
             buf = io.BytesIO()
@@ -288,6 +358,14 @@ class MicrophoneTranscriber:
             )
 
             text = (text or "").strip()
+
+            # FIX 3: drop known Whisper hallucination phrases
+            if text:
+                text_lower = text.lower()
+                for phrase in _WHISPER_HALLUCINATIONS:
+                    if phrase in text_lower:
+                        print(f"🚫 [Mic] Hallucination blocked: {repr(text)}", flush=True)
+                        return
 
             if text and len(text) >= 2:
                 for pattern, name in self.name_variations.items():
