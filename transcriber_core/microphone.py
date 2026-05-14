@@ -318,19 +318,17 @@ class MicrophoneTranscriber:
             if self.keep_files:
                 filename = self.save_audio(chunk)
 
-            # response_format="text" → plain string, no JSON envelope to parse.
-            # prompt is vocabulary-only (proper nouns). Instruction-style
-            # prompts are NOT respected by whisper-1 and get parroted back
-            # into the transcript when audio is ambiguous.
-            # temperature=0 → fully deterministic decoding; suppresses the
-            # higher-temperature fallback path that fuels repetition loops.
+            # No prompt: whisper biases output toward whatever's in the prompt
+            # field when audio is ambiguous, so even vocabulary primers cause
+            # hallucinations ("PeepingNami" everywhere). Name normalization is
+            # handled post-hoc via name_variations regex below.
+            # temperature=0 → fully deterministic decoding.
             text = self.client.audio.transcriptions.create(
                 model="whisper-1",
                 file=("audio.wav", buf, "audio/wav"),
                 language="en",
                 response_format="text",
                 temperature=0,
-                prompt="Nami, PeepingNami",
             )
 
             text = (text or "").strip()
