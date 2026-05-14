@@ -1,45 +1,9 @@
 """
-transcriber_core/microphone.py
-─────────────────────────────────────────────────────────────────────────────
-Speed improvements over the previous version:
+transcriber_core/microphone.py — batch microphone transcriber.
 
-  1. VAD_SILENCE_DURATION 0.55s → 0.30s
-       Saves ~250 ms at the tail of every utterance.
-
-  2. 120 ms pre-roll ring buffer
-       The callback continuously keeps the last PRE_ROLL_SECS of audio in a
-       circular deque. Every flushed chunk is prepended with that pre-roll so
-       the shorter silence timeout doesn't clip the first phoneme of speech.
-
-  3. HTTP/2 on the OpenAI client (httpx)
-       Eliminates the per-request TCP + TLS handshake overhead when multiple
-       chunks are in-flight simultaneously. Falls back to HTTP/1.1 silently
-       if httpx[http2] isn't installed.
-
-  4. response_format="text"
-       Skips Whisper returning a JSON envelope — the API streams the plain
-       string directly, saving a small but free deserialization step.
-
-  5. Calibration 2.5s → 1.5s
-       Room-noise RMS stabilises in well under a second; 1.5s is plenty.
-
-Hallucination fixes (v2):
-
-  FIX 1 — MIN_CHUNK_RMS gate in process_chunk
-       Rejects chunks whose raw RMS is below MIN_CHUNK_RMS before any
-       normalization. Music/ambient noise that barely tripped VAD never
-       reaches Whisper.
-
-  FIX 2 — Conditional normalization in _preprocess
-       Previously any RMS > 1e-6 triggered normalization, boosting near-
-       silence up to SPEECH_NORM_RMS and feeding Whisper a convincingly
-       loud-but-meaningless signal. Now only normalizes when RMS > 0.01
-       (roughly the threshold for real speech energy).
-
-  FIX 3 — Post-transcription hallucination blocklist
-       Whisper-1 has well-known phantom outputs ("thank you for watching",
-       FEMA URLs, engvid, etc.) that appear when audio is ambiguous. Any
-       transcript containing a blocklist phrase is silently dropped.
+Pipeline: input stream → HPF → RMS-based VAD with pre-roll → chunk flush on
+silence → -40 dBFS RMS gate → normalize → OpenAI whisper-1 → hallucination
+blocklist → result queue.
 """
 
 import collections
@@ -76,16 +40,16 @@ HPF_CUTOFF_HZ   = 80.0
 SPEECH_NORM_RMS = 0.08
 
 # ── Hallucination guards ──────────────────────────────────────────────────────
-# FIX 1: chunks whose raw RMS is below this are skipped before normalization
-# can inflate them. Tune down to 0.005 if soft speech is being dropped.
-MIN_CHUNK_RMS = 0.008
+# Hard volume gate: chunks below -40 dBFS RMS (0.01) are dropped before
+# Whisper ever sees them. Music/ambient that barely tripped VAD never reaches
+# the API. -40 dBFS RMS corresponds to RMS = 10**(-40/20) = 0.01.
+MIN_CHUNK_RMS = 0.01
 
-# FIX 2: normalization is only applied when RMS exceeds this floor.
-# Prevents near-silence / music from being boosted to speech level.
+# Normalization is only applied when RMS exceeds this floor.
 MIN_NORM_RMS = 0.01
 
-# FIX 3: Whisper-1 phantom outputs — transcripts matching any of these are
-# silently dropped. All comparisons are lowercased substring matches.
+# Whisper-1 phantom outputs — transcripts matching any of these are silently
+# dropped. All comparisons are lowercased substring matches.
 _WHISPER_HALLUCINATIONS = {
     "thank you for watching",
     "thanks for watching",
@@ -103,11 +67,21 @@ _WHISPER_HALLUCINATIONS = {
     "this has been a presentation",
     "subtitles by",
     "translated by",
+    "transcribed by",
+    "otter.ai",
+    "new thinking allowed",
+    "copyright ©",
+    "©",
+    # Prompt-leak phrases (whisper-1 sometimes echoes the prompt back)
+    "do not add punctuation",
+    "punctuation that wasn't spoken",
+    "the speaker may",
+    "transcribe exactly as spoken",
     "[ music ]",
     "[music]",
     "♪",
     # Whisper sometimes emits these when it hears only silence / noise
-    "you",                          # single-word phantom — too short to be real anyway
+    "you",
     "thank you.",
     "thanks.",
 }
@@ -344,22 +318,25 @@ class MicrophoneTranscriber:
             if self.keep_files:
                 filename = self.save_audio(chunk)
 
-            # response_format="text" → plain string, no JSON envelope to parse
+            # response_format="text" → plain string, no JSON envelope to parse.
+            # prompt is vocabulary-only (proper nouns). Instruction-style
+            # prompts are NOT respected by whisper-1 and get parroted back
+            # into the transcript when audio is ambiguous.
+            # temperature=0 → fully deterministic decoding; suppresses the
+            # higher-temperature fallback path that fuels repetition loops.
             text = self.client.audio.transcriptions.create(
                 model="whisper-1",
                 file=("audio.wav", buf, "audio/wav"),
                 language="en",
                 response_format="text",
-                prompt=(
-                    "Transcribe exactly as spoken. "
-                    "The speaker may talk quickly, loudly, or trail off. "
-                    "Do not add punctuation that wasn't spoken."
-                ),
+                temperature=0,
+                prompt="Nami, PeepingNami",
             )
 
             text = (text or "").strip()
 
-            # FIX 3: drop known Whisper hallucination phrases
+            # Drop known Whisper hallucination phrases (prompt leaks, copyright
+            # boilerplate, "thanks for watching", etc.)
             if text:
                 text_lower = text.lower()
                 for phrase in _WHISPER_HALLUCINATIONS:
