@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/thomasbalaban/miniconda3/envs/gemini-screen-watcher/bin/pip install *)",
+      "Bash(/Users/thomasbalaban/miniconda3/envs/gemini-screen-watcher/bin/python -c \"import sys; print\\('OK'\\)\")",
+      "Bash(/Users/thomasbalaban/miniconda3/envs/gemini-screen-watcher/bin/pip list *)"
+    ]
+  }
+}
