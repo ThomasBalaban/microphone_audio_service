@@ -3,6 +3,7 @@ Configuration for the Microphone Audio Service.
 """
 import os
 import sys
+from pathlib import Path
 
 # ── Path bootstrap ────────────────────────────────────────────────────────────
 _THIS_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -14,12 +15,30 @@ for _p in (_THIS_DIR, _PARENT_DIR):
 
 print(f"[config] sys.path[0:3] = {sys.path[:3]}", flush=True)
 
-try:
-    from api_keys import GEMINI_API_KEY, OPENAI_API_KEY  # noqa: F401
-    print("[config] ✅ api_keys loaded", flush=True)
-except ImportError as e:
-    print(f"[config] ❌ api_keys FAILED: {e}", flush=True)
-    raise
+
+def _load_sibling_secrets() -> None:
+    secrets_dir = Path(__file__).resolve().parent.parent / "director_ui" / "secrets"
+    if not secrets_dir.is_dir():
+        return
+    for path in sorted(secrets_dir.glob("*.env")):
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+if "GEMINI_API_KEY" not in os.environ or "OPENAI_API_KEY" not in os.environ:
+    _load_sibling_secrets()
+
+for _required in ("GEMINI_API_KEY", "OPENAI_API_KEY"):
+    if _required not in os.environ:
+        raise RuntimeError(
+            f"Missing required env var {_required}. "
+            "Credentials live in director_ui/secrets/*.env. Start this service "
+            "via the launcher, or export the variable manually."
+        )
 
 try:
     import transcriber_core  # noqa: F401

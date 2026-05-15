@@ -92,16 +92,17 @@ def _build_openai_client():
     Build an OpenAI client that uses HTTP/2 when httpx[http2] is available.
     Falls back to the default HTTP/1.1 client silently.
     """
-    from api_keys import OPENAI_API_KEY  # noqa: PLC0415
+    import os
+    api_key = os.environ["OPENAI_API_KEY"]
     try:
         import httpx
         http_client = httpx.Client(http2=True)
         from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+        client = OpenAI(api_key=api_key, http_client=http_client)
         print("✅ [Mic] OpenAI client ready (HTTP/2)", flush=True)
     except Exception:
         from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        client = OpenAI(api_key=api_key)
         print("✅ [Mic] OpenAI client ready (HTTP/1.1)", flush=True)
     return client
 
